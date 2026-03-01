@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Datelike, Duration, FixedOffset, NaiveDate, TimeZone, Utc};
+use std::io::IsTerminal;
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 use fsrs::{MemoryState, FSRS};
@@ -770,12 +771,20 @@ fn find_source_location(topic: &str) -> Result<Option<String>> {
     )))
 }
 
+fn is_tty() -> bool {
+    std::io::stdout().is_terminal()
+}
+
 fn print_panel(title: &str) {
-    let w = title.chars().count() + 2;
-    println!();
-    println!("╭{}╮", "─".repeat(w));
-    println!("│ {} │", title.bold());
-    println!("╰{}╯", "─".repeat(w));
+    if is_tty() {
+        let w = title.chars().count() + 2;
+        println!();
+        println!("╭{}╮", "─".repeat(w));
+        println!("│ {} │", title.bold());
+        println!("╰{}╯", "─".repeat(w));
+    } else {
+        println!("## {title}");
+    }
 }
 
 fn normalize(s: &str) -> String {

@@ -2,7 +2,12 @@
 name = "melete"
 version = "0.1.0"
 edition = "2021"
-description = "GARP RAI spaced repetition CLI — Rust port of rai.py"
+description = "FSRS-powered spaced repetition CLI for exam preparation"
+license = "MIT"
+repository = "https://github.com/terry-li-hm/melete"
+homepage = "https://github.com/terry-li-hm/melete"
+keywords = ["spaced-repetition", "fsrs", "exam", "cli", "flashcards"]
+categories = ["command-line-utilities"]
 
 [[bin]]
 name = "melete"

@@ -1,6 +1,6 @@
 [package]
 name = "melete"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "FSRS-powered spaced repetition CLI for exam preparation"
 license = "MIT"

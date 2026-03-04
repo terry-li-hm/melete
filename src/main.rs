@@ -3,7 +3,7 @@ use chrono::{DateTime, Datelike, Duration, FixedOffset, NaiveDate, TimeZone, Utc
 use std::io::IsTerminal;
 use clap::{Parser, Subcommand};
 use colored::Colorize;
-use fsrs::{MemoryState, FSRS};
+use fsrs::{DEFAULT_PARAMETERS, MemoryState, FSRS};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -898,7 +898,7 @@ fn schedule_card(
     rating: RatingKind,
     now: DateTime<FixedOffset>,
 ) -> Result<PyCard> {
-    let fsrs = FSRS::new(None).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let fsrs = FSRS::new(Some(&DEFAULT_PARAMETERS)).map_err(|e| anyhow::anyhow!("{:?}", e))?;
     let prev_memory = if card.stability > 0.0 && card.difficulty > 0.0 {
         Some(MemoryState {
             stability: card.stability as f32,

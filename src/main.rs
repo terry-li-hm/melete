@@ -70,7 +70,7 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Command {
     Session { n: Option<usize> },
-    Record { topic: String, rating: String },
+    Record { topic: String, rating: String, #[arg(long, short = 'n')] dry_run: bool },
     End,
     Today,
     Stats,
@@ -190,7 +190,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Some(Command::Session { n }) => cmd_session(n)?,
-        Some(Command::Record { topic, rating }) => cmd_record(&topic, &rating)?,
+        Some(Command::Record { topic, rating, dry_run }) => cmd_record(&topic, &rating, dry_run)?,
         Some(Command::End) => cmd_end_session()?,
         Some(Command::Today) => cmd_today()?,
         Some(Command::Stats) => cmd_stats()?,
@@ -1129,7 +1129,7 @@ fn cmd_session(count: Option<usize>) -> Result<()> {
     Ok(())
 }
 
-fn cmd_record(topic_input: &str, rating_str: &str) -> Result<()> {
+fn cmd_record(topic_input: &str, rating_str: &str, dry_run: bool) -> Result<()> {
     let mut rating = match rating_from_str(rating_str) {
         Some(r) => r,
         None => {
@@ -1152,6 +1152,7 @@ fn cmd_record(topic_input: &str, rating_str: &str) -> Result<()> {
         return Ok(());
     };
 
+    let intended_rating = rating;
     let topic_info = tracker.topics.get(&topic).cloned().unwrap_or_default();
     let topic_rate = topic_info.rate;
     if topic_rate < 0.60 && (rating == RatingKind::Good || rating == RatingKind::Easy) {
@@ -1176,15 +1177,16 @@ fn cmd_record(topic_input: &str, rating_str: &str) -> Result<()> {
         .unwrap_or_else(|| new_card(now));
     let card = schedule_card(card, rating, now)?;
 
-    state.cards.insert(topic.clone(), card.clone());
-    state.review_log.push(ReviewEntry {
-        topic: topic.clone(),
-        rating: rating.log_name().to_string(),
-        date: now.to_rfc3339(),
-    });
-
-    save_state(&state)?;
-    update_tracker_record(&topic, rating)?;
+    if !dry_run {
+        state.cards.insert(topic.clone(), card.clone());
+        state.review_log.push(ReviewEntry {
+            topic: topic.clone(),
+            rating: rating.log_name().to_string(),
+            date: now.to_rfc3339(),
+        });
+        save_state(&state)?;
+        update_tracker_record(&topic, intended_rating)?;
+    }
 
     let due_hkt = card_due_hkt(&card).unwrap_or(now);
     let days = due_hkt.signed_duration_since(now_hkt()).num_days();
@@ -1196,7 +1198,8 @@ fn cmd_record(topic_input: &str, rating_str: &str) -> Result<()> {
     };
 
     println!();
-    println!("  {}  {}", display, topic.bold());
+    let dry_run_suffix = if dry_run { "  (dry run)".dimmed().to_string() } else { String::new() };
+    println!("  {}  {}{}", display, topic.bold(), dry_run_suffix);
     println!(
         "  Next: {} ({:+}d)  |  {}",
         due_hkt.format("%b %d").to_string().cyan(),

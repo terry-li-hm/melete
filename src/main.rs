@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Context, Result};
-use chrono::{DateTime, Datelike, Duration, FixedOffset, NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, Duration, FixedOffset, NaiveDate, TimeZone, Utc};
 use std::io::IsTerminal;
 use clap::{Parser, Subcommand};
 use colored::Colorize;
@@ -70,7 +70,7 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Command {
     Session { n: Option<usize> },
-    Record { topic: String, rating: String, #[arg(long, short = 'n')] dry_run: bool },
+    Record { topic: String, rating: String, #[arg(long, short = 'c')] confidence: Option<String>, #[arg(long, short = 'n')] dry_run: bool },
     End,
     Today,
     Stats,
@@ -85,6 +85,7 @@ struct ReviewEntry {
     topic: String,
     rating: String,
     date: String,
+    pub confidence: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -150,15 +151,6 @@ enum RatingKind {
 }
 
 impl RatingKind {
-    fn fsrs_value(self) -> u32 {
-        match self {
-            RatingKind::Again => 1,
-            RatingKind::Hard => 2,
-            RatingKind::Good => 3,
-            RatingKind::Easy => 4,
-        }
-    }
-
     fn result_str(self) -> &'static str {
         match self {
             RatingKind::Again => "MISS",
@@ -190,7 +182,9 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Some(Command::Session { n }) => cmd_session(n)?,
-        Some(Command::Record { topic, rating, dry_run }) => cmd_record(&topic, &rating, dry_run)?,
+        Some(Command::Record { topic, rating, confidence, dry_run }) => {
+            cmd_record(&topic, &rating, confidence, dry_run)?
+        }
         Some(Command::End) => cmd_end_session()?,
         Some(Command::Today) => cmd_today()?,
         Some(Command::Stats) => cmd_stats()?,
@@ -1129,7 +1123,26 @@ fn cmd_session(count: Option<usize>) -> Result<()> {
     Ok(())
 }
 
-fn cmd_record(topic_input: &str, rating_str: &str, dry_run: bool) -> Result<()> {
+fn cmd_record(
+    topic_input: &str,
+    rating_str: &str,
+    confidence: Option<String>,
+    dry_run: bool,
+) -> Result<()> {
+    let conf = if let Some(c) = confidence {
+        let cu = c.to_uppercase();
+        if !["C", "U", "G"].contains(&cu.as_str()) {
+            eprintln!(
+                "{}",
+                format!("Invalid confidence: {}. Valid: C, U, G", c).red()
+            );
+            std::process::exit(1);
+        }
+        Some(cu)
+    } else {
+        None
+    };
+
     let mut rating = match rating_from_str(rating_str) {
         Some(r) => r,
         None => {
@@ -1183,6 +1196,7 @@ fn cmd_record(topic_input: &str, rating_str: &str, dry_run: bool) -> Result<()> 
             topic: topic.clone(),
             rating: rating.log_name().to_string(),
             date: now.to_rfc3339(),
+            confidence: conf,
         });
         save_state(&state)?;
         update_tracker_record(&topic, intended_rating)?;
@@ -1261,6 +1275,32 @@ fn cmd_stats() -> Result<()> {
                 tag
             );
         }
+        println!();
+    }
+
+    let state = load_state()?;
+    let mut confident_miss_counts: HashMap<String, i32> = HashMap::new();
+    for r in &state.review_log {
+        let rl = r.rating.to_lowercase();
+        if (rl == "again" || rl == "miss") && r.confidence.as_deref() == Some("C") {
+            *confident_miss_counts.entry(r.topic.clone()).or_insert(0) += 1;
+        }
+    }
+
+    if !confident_miss_counts.is_empty() {
+        let total_c_misses: i32 = confident_miss_counts.values().sum();
+        let mut top_offenders: Vec<_> = confident_miss_counts.into_iter().collect();
+        top_offenders.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+        println!("{}", "Confident misses (all time):".bold());
+        println!("  Total: {}", total_c_misses);
+        let offenders_str = top_offenders
+            .iter()
+            .take(5)
+            .map(|(t, count)| format!("{} ({} times)", t, count))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("  Top offenders: {}", offenders_str);
         println!();
     }
 
@@ -1444,6 +1484,7 @@ fn cmd_today() -> Result<()> {
 }
 
 fn cmd_end_session() -> Result<()> {
+    let state = load_state()?;
     let path = tracker_path()?;
     if !path.exists() {
         println!("{}", "Tracker not found".red());
@@ -1470,6 +1511,26 @@ fn cmd_end_session() -> Result<()> {
         new.to_string().bold(),
         old
     );
+
+    let today_reviews = get_today_reviews(&state);
+    let confident_misses: Vec<_> = today_reviews
+        .iter()
+        .filter(|r| {
+            let rl = r.rating.to_lowercase();
+            (rl == "again" || rl == "miss") && r.confidence.as_deref() == Some("C")
+        })
+        .collect();
+
+    if !confident_misses.is_empty() {
+        println!();
+        println!("{}", "⚠  Confident misses this session:".yellow().bold());
+        let mut topics: Vec<_> = confident_misses.iter().map(|r| r.topic.clone()).collect();
+        topics.sort();
+        topics.dedup();
+        println!("   Topics: {}", topics.join(", "));
+        println!("   → These are high-priority for next session — overconfidence is the most dangerous blind spot.");
+    }
+
     println!();
 
     Ok(())

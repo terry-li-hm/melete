@@ -1199,7 +1199,7 @@ fn cmd_record(
             rating: rating.log_name().to_string(),
             date: now.to_rfc3339(),
             confidence: conf,
-            card_snapshot: pre_review_card,
+            card_snapshot: pre_review_card.clone(),
         });
         save_state(&state)?;
         update_tracker_record(&topic, intended_rating)?;
@@ -1223,6 +1223,13 @@ fn cmd_record(
         days,
         state_name(card.state)
     );
+    if !dry_run {
+        if pre_review_card.is_some() {
+            println!("  {}", "✓ snapshot saved".dimmed());
+        } else {
+            println!("  {}", "⚠ no snapshot (first record or pre-snapshot entry)".dimmed());
+        }
+    }
     println!();
 
     Ok(())

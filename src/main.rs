@@ -71,6 +71,7 @@ struct Cli {
 enum Command {
     Session { n: Option<usize> },
     Record { topic: String, rating: String, #[arg(long, short = 'c')] confidence: Option<String>, #[arg(long, short = 'n')] dry_run: bool },
+    Void { topic: String, #[arg(long, short = 'n')] dry_run: bool },
     End,
     Today,
     Stats,
@@ -86,6 +87,8 @@ struct ReviewEntry {
     rating: String,
     date: String,
     pub confidence: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub card_snapshot: Option<PyCard>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -185,6 +188,7 @@ fn main() -> Result<()> {
         Some(Command::Record { topic, rating, confidence, dry_run }) => {
             cmd_record(&topic, &rating, confidence, dry_run)?
         }
+        Some(Command::Void { topic, dry_run }) => cmd_void(&topic, dry_run)?,
         Some(Command::End) => cmd_end_session()?,
         Some(Command::Today) => cmd_today()?,
         Some(Command::Stats) => cmd_stats()?,
@@ -203,6 +207,7 @@ fn print_help() {
     println!();
     println!("  {} [N]", "session".cyan());
     println!("  {} TOPIC RATING", "record".cyan());
+    println!("  {} TOPIC", "void".cyan());
     println!("  {}", "end".cyan());
     println!("  {}", "today".cyan());
     println!("  {}", "stats".cyan());
@@ -1183,11 +1188,8 @@ fn cmd_record(
     }
 
     let now = now_hkt();
-    let card = state
-        .cards
-        .get(&topic)
-        .cloned()
-        .unwrap_or_else(|| new_card(now));
+    let pre_review_card = state.cards.get(&topic).cloned();
+    let card = pre_review_card.clone().unwrap_or_else(|| new_card(now));
     let card = schedule_card(card, rating, now)?;
 
     if !dry_run {
@@ -1197,6 +1199,7 @@ fn cmd_record(
             rating: rating.log_name().to_string(),
             date: now.to_rfc3339(),
             confidence: conf,
+            card_snapshot: pre_review_card,
         });
         save_state(&state)?;
         update_tracker_record(&topic, intended_rating)?;
@@ -1221,6 +1224,110 @@ fn cmd_record(
         state_name(card.state)
     );
     println!();
+
+    Ok(())
+}
+
+fn cmd_void(topic_input: &str, dry_run: bool) -> Result<()> {
+    let mut state = load_state()?;
+
+    // Find all entries for this topic in review_log
+    let topic_entries: Vec<usize> = state
+        .review_log
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.topic == topic_input)
+        .map(|(i, _)| i)
+        .collect();
+
+    if topic_entries.is_empty() {
+        eprintln!("No review history found for {}", topic_input);
+        std::process::exit(1);
+    }
+
+    let last_idx = *topic_entries.last().unwrap();
+    let last_entry = state.review_log[last_idx].clone();
+
+    let dry_run_suffix = if dry_run { "  (dry run)" } else { "" };
+
+    if topic_entries.len() == 1 {
+        // Only one review — remove it and reset to new state
+        if dry_run {
+            println!(
+                "Would void last review for {} (was: {} on {}). Topic reset to new{}",
+                topic_input,
+                last_entry.rating,
+                last_entry.date,
+                dry_run_suffix
+            );
+        } else {
+            state.review_log.remove(last_idx);
+            state.cards.remove(topic_input);
+            save_state(&state)?;
+            println!(
+                "Voided last review for {} (was: {} on {}). Topic reset to new",
+                topic_input,
+                last_entry.rating,
+                last_entry.date
+            );
+        }
+    } else {
+        // 2+ entries — restore card state from snapshot of the last entry (pre-review state)
+        // The snapshot on the last entry is the card state *before* that review was applied.
+        // If no snapshot exists (old entries before this feature), fall back to snapshot on
+        // the second-to-last entry if available, otherwise we cannot restore precisely.
+        let prev_idx = topic_entries[topic_entries.len() - 2];
+        let restored_card = if let Some(snap) = &last_entry.card_snapshot {
+            // snapshot on last entry = card state before that review
+            Some(snap.clone())
+        } else if let Some(snap) = &state.review_log[prev_idx].card_snapshot {
+            // fallback: use snapshot stored on second-to-last entry (card state before that review)
+            Some(snap.clone())
+        } else {
+            None
+        };
+
+        // Determine the due date string for the confirmation message
+        let next_due_str = match &restored_card {
+            Some(c) => card_due_hkt(c)
+                .map(|d| d.format("%Y-%m-%d").to_string())
+                .unwrap_or_else(|| c.due.clone()),
+            None => "(unknown — no snapshot available)".to_string(),
+        };
+
+        if dry_run {
+            println!(
+                "Would void last review for {} (was: {} on {}). Next due: {}{}",
+                topic_input,
+                last_entry.rating,
+                last_entry.date,
+                next_due_str,
+                dry_run_suffix
+            );
+        } else {
+            state.review_log.remove(last_idx);
+            match restored_card {
+                Some(card) => {
+                    state.cards.insert(topic_input.to_string(), card);
+                }
+                None => {
+                    // No snapshot available; leave current card state as-is and warn
+                    eprintln!(
+                        "Warning: no card_snapshot on voided entry — FSRS card state not restored. \
+                         Re-run `melete record` to re-establish scheduling."
+                    );
+                }
+            }
+            save_state(&state)?;
+            println!(
+                "Voided last review for {} (was: {} on {}). Next due: {}",
+                topic_input,
+                last_entry.rating,
+                last_entry.date,
+                next_due_str
+            );
+        }
+    }
 
     Ok(())
 }
@@ -1712,7 +1819,7 @@ mod tests {
 
     #[test]
     fn parse_py_card_json_string() {
-        let raw = r#"{\"card_id\": 1, \"state\": 2, \"step\": null, \"stability\": 1.2, \"difficulty\": 3.4, \"due\": \"2026-02-01T00:00:00+00:00\", \"last_review\": \"2026-01-01T00:00:00+00:00\"}"#;
+        let raw = r#"{"card_id": 1, "state": 2, "step": null, "stability": 1.2, "difficulty": 3.4, "due": "2026-02-01T00:00:00+00:00", "last_review": "2026-01-01T00:00:00+00:00"}"#;
         let card: PyCard = serde_json::from_str(raw).unwrap();
         assert_eq!(card.state, 2);
         assert!(card.step.is_none());

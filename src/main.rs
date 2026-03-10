@@ -70,7 +70,7 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Command {
     Session { n: Option<usize> },
-    Record { topic: String, rating: String, #[arg(long, short = 'c')] confidence: Option<String>, #[arg(long, short = 'n')] dry_run: bool },
+    Record { topic: String, rating: String, #[arg(long, short = 'c')] confidence: Option<String>, #[arg(long, short = 'n')] dry_run: bool, #[arg(long = "note", short = 'N')] note: Option<String> },
     Void { topic: String, #[arg(long, short = 'n')] dry_run: bool },
     End,
     Today,
@@ -185,8 +185,8 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Some(Command::Session { n }) => cmd_session(n)?,
-        Some(Command::Record { topic, rating, confidence, dry_run }) => {
-            cmd_record(&topic, &rating, confidence, dry_run)?
+        Some(Command::Record { topic, rating, confidence, dry_run, note }) => {
+            cmd_record(&topic, &rating, confidence, dry_run, note)?
         }
         Some(Command::Void { topic, dry_run }) => cmd_void(&topic, dry_run)?,
         Some(Command::End) => cmd_end_session()?,
@@ -206,7 +206,7 @@ fn print_help() {
     println!("{}", "melete — GARP RAI spaced repetition".bold());
     println!();
     println!("  {} [N]", "session".cyan());
-    println!("  {} TOPIC RATING", "record".cyan());
+    println!("  {} TOPIC RATING [-c C|U|G] [-N NOTE]", "record".cyan());
     println!("  {} TOPIC", "void".cyan());
     println!("  {}", "end".cyan());
     println!("  {}", "today".cyan());
@@ -484,7 +484,7 @@ fn parse_tracker() -> Result<Tracker> {
     })
 }
 
-fn update_tracker_record(topic: &str, rating: RatingKind) -> Result<()> {
+fn update_tracker_record(topic: &str, rating: RatingKind, note: Option<&str>) -> Result<()> {
     let path = tracker_path()?;
     if !path.exists() {
         return Ok(());
@@ -533,11 +533,17 @@ fn update_tracker_record(topic: &str, rating: RatingKind) -> Result<()> {
         text = topic_re.replace(&text, replacement).to_string();
     }
 
+    let note_cell = if let Some(n) = note {
+        format!("(recorded via rai) — {}", n)
+    } else {
+        "(recorded via rai)".to_string()
+    };
     let history_line = format!(
-        "| {} | {} | {} | (recorded via rai) |",
+        "| {} | {} | {} | {} |",
         now_hkt().format("%Y-%m-%d"),
         topic,
-        rating.result_str()
+        rating.result_str(),
+        note_cell
     );
 
     let mut lines: Vec<String> = text.lines().map(|s| s.to_string()).collect();
@@ -1133,6 +1139,7 @@ fn cmd_record(
     rating_str: &str,
     confidence: Option<String>,
     dry_run: bool,
+    note: Option<String>,
 ) -> Result<()> {
     let conf = if let Some(c) = confidence {
         let cu = c.to_uppercase();
@@ -1202,7 +1209,7 @@ fn cmd_record(
             card_snapshot: pre_review_card.clone(),
         });
         save_state(&state)?;
-        update_tracker_record(&topic, intended_rating)?;
+        update_tracker_record(&topic, intended_rating, note.as_deref())?;
     }
 
     let due_hkt = card_due_hkt(&card).unwrap_or(now);
@@ -1229,6 +1236,9 @@ fn cmd_record(
         } else {
             println!("  {}", "⚠ no snapshot (first record or pre-snapshot entry)".dimmed());
         }
+    }
+    if let Some(ref n) = note {
+        println!("  {}  {}", "Note".dimmed(), n);
     }
     println!();
 

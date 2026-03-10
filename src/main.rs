@@ -251,9 +251,20 @@ fn get_phase() -> (i32, &'static str) {
     }
 }
 
+fn module_weight(topic_id: &str) -> f32 {
+    match topic_id.split('-').next().unwrap_or("") {
+        "M1" => 0.10,
+        "M2" => 0.30,
+        "M3" => 0.20,
+        "M4" => 0.20,
+        "M5" => 0.20,
+        _ => 0.0,
+    }
+}
+
 fn daily_quota() -> usize {
     match get_phase().0 {
-        1 => 5,
+        1 => 10,
         2 => 15,
         _ => 20,
     }
@@ -999,26 +1010,31 @@ fn cmd_session(count: Option<usize>) -> Result<()> {
 
     let mut due: Vec<(String, TopicInfo, i64)> = Vec::new();
 
-    for (topic, info) in &tracker.topics {
+    // FSRS state is the authoritative topic list after taxonomy migration.
+    // Tracker is secondary — used for accuracy history only.
+    // Topics in tracker but not in FSRS state (old IDs) are silently ignored.
+    for (topic, card) in &state.cards {
         if tested_today.contains(topic) {
             continue;
         }
-        if let Some(card) = state.cards.get(topic) {
-            if let Some(due_dt) = card_due_hkt(card) {
-                if due_dt <= now {
-                    let overdue = now.signed_duration_since(due_dt).num_days();
-                    due.push((topic.clone(), info.clone(), overdue));
-                }
-            } else {
-                due.push((topic.clone(), info.clone(), 999));
+        let info = tracker.topics.get(topic).cloned().unwrap_or_default();
+        if let Some(due_dt) = card_due_hkt(card) {
+            if due_dt <= now {
+                let overdue = now.signed_duration_since(due_dt).num_days();
+                due.push((topic.clone(), info, overdue));
             }
         } else {
-            due.push((topic.clone(), info.clone(), 999));
+            due.push((topic.clone(), info, 999));
         }
     }
 
     due.sort_by(|a, b| {
         b.2.cmp(&a.2)
+            .then_with(|| {
+                module_weight(&b.0)
+                    .partial_cmp(&module_weight(&a.0))
+                    .unwrap_or(Ordering::Equal)
+            })
             .then_with(|| a.1.rate.partial_cmp(&b.1.rate).unwrap_or(Ordering::Equal))
     });
 
@@ -1106,7 +1122,8 @@ fn cmd_session(count: Option<usize>) -> Result<()> {
     println!();
 
     for (idx, (topic, info, overdue)) in interleaved.iter().enumerate() {
-        let mode = get_mode(info.rate);
+        let is_new = info.attempts == 0;
+        let mode = if is_new { "drill" } else { get_mode(info.rate) };
         let colored_topic: colored::ColoredString = match mode {
             "drill" => topic.red().bold(),
             "free-recall" => topic.yellow().bold(),
@@ -1117,15 +1134,28 @@ fn cmd_session(count: Option<usize>) -> Result<()> {
         } else {
             String::new()
         };
+        let new_tag = if is_new {
+            format!(" {}", "[new]".bright_magenta())
+        } else {
+            String::new()
+        };
         let source = find_source_location(topic)?.unwrap_or_else(|| "not found".to_string());
+        let weight_pct = (module_weight(topic) * 100.0).round() as i32;
+        let accuracy_str = if is_new {
+            "0%".to_string()
+        } else {
+            format!("{:.0}%", info.rate * 100.0)
+        };
         println!(
-            "  Q{}: {}  |  {} ({:.0}%)  |  overdue {}d{}",
+            "  Q{}: {}  |  {} ({})  |  overdue {}d  |  wt {}%{}{}",
             idx + 1,
             colored_topic,
             mode,
-            info.rate * 100.0,
+            accuracy_str,
             overdue,
-            drill_tag
+            weight_pct,
+            drill_tag,
+            new_tag
         );
         println!("      {}", source.dimmed());
     }
@@ -1173,7 +1203,14 @@ fn cmd_record(
     let mut state = load_state()?;
     let tracker = parse_tracker()?;
 
-    let Some(topic) = resolve_topic(topic_input, &tracker) else {
+    // If the input exactly matches a key in the FSRS state (new IDs after migration),
+    // use it directly without going through resolve_topic which only knows tracker topics.
+    let topic_opt = if state.cards.contains_key(topic_input) {
+        Some(topic_input.to_string())
+    } else {
+        resolve_topic(topic_input, &tracker)
+    };
+    let Some(topic) = topic_opt else {
         return Ok(());
     };
 
@@ -1432,20 +1469,29 @@ fn cmd_stats() -> Result<()> {
 }
 
 fn cmd_topics() -> Result<()> {
+    let state = load_state()?;
     let tracker = parse_tracker()?;
     let drilled = topics_with_drills()?;
-    let mut topics: Vec<_> = tracker.topics.into_iter().collect();
+    // Enumerate from FSRS state (authoritative); look up tracker for accuracy
+    let mut topics: Vec<(String, TopicInfo)> = state
+        .cards
+        .keys()
+        .map(|t| {
+            let info = tracker.topics.get(t).cloned().unwrap_or_default();
+            (t.clone(), info)
+        })
+        .collect();
     topics.sort_by(|a, b| a.1.rate.partial_cmp(&b.1.rate).unwrap_or(Ordering::Equal));
 
     println!();
-    println!("{}", "All topics:".bold());
+    println!("{}", format!("All topics ({}):", topics.len()).bold());
     println!();
 
     for (t, i) in topics {
         let rate_str = if i.attempts > 0 {
             format!("{:.0}%", i.rate * 100.0)
         } else {
-            "—".to_string()
+            "[new]".to_string()
         };
         let tag = if drilled.contains(&t) {
             format!(" {}", "[drill]".cyan())
@@ -1453,7 +1499,9 @@ fn cmd_topics() -> Result<()> {
             String::new()
         };
         let line = format!("{}: {} ({}/{}){}", t, rate_str, i.correct, i.attempts, tag);
-        if i.rate < 0.60 {
+        if i.attempts == 0 {
+            println!("  {}", line.dimmed());
+        } else if i.rate < 0.60 {
             println!("  {}", line.red());
         } else if i.rate < 0.70 {
             println!("  {}", line.yellow());
@@ -1468,19 +1516,15 @@ fn cmd_topics() -> Result<()> {
 
 fn cmd_due() -> Result<()> {
     let state = load_state()?;
-    let tracker = parse_tracker()?;
     let now = now_hkt();
 
     let mut due_topics = Vec::new();
-    for topic in tracker.topics.keys() {
-        if let Some(card) = state.cards.get(topic) {
-            if let Some(due_dt) = card_due_hkt(card) {
-                if due_dt <= now {
-                    let overdue = now.signed_duration_since(due_dt).num_days();
-                    due_topics.push((topic.clone(), overdue, state_name(card.state).to_string()));
-                }
-            } else {
-                due_topics.push((topic.clone(), 999, "new".to_string()));
+    // Enumerate from FSRS state (authoritative topic list after taxonomy migration)
+    for (topic, card) in &state.cards {
+        if let Some(due_dt) = card_due_hkt(card) {
+            if due_dt <= now {
+                let overdue = now.signed_duration_since(due_dt).num_days();
+                due_topics.push((topic.clone(), overdue, state_name(card.state).to_string()));
             }
         } else {
             due_topics.push((topic.clone(), 999, "new".to_string()));

@@ -99,7 +99,7 @@ struct PyCard {
     stability: f64,
     difficulty: f64,
     due: String,
-    last_review: String,
+    last_review: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -335,7 +335,7 @@ fn card_due_hkt(card: &PyCard) -> Option<DateTime<FixedOffset>> {
 }
 
 fn card_last_review(card: &PyCard) -> Option<DateTime<FixedOffset>> {
-    parse_datetime_any(&card.last_review).map(|d| d.with_timezone(&hkt()))
+    card.last_review.as_deref().and_then(|s| parse_datetime_any(s)).map(|d| d.with_timezone(&hkt()))
 }
 
 fn new_card(now: DateTime<FixedOffset>) -> PyCard {
@@ -346,7 +346,7 @@ fn new_card(now: DateTime<FixedOffset>) -> PyCard {
         stability: 0.0,
         difficulty: 0.0,
         due: now.with_timezone(&Utc).to_rfc3339(),
-        last_review: now.with_timezone(&Utc).to_rfc3339(),
+        last_review: Some(now.with_timezone(&Utc).to_rfc3339()),
     }
 }
 
@@ -940,7 +940,10 @@ fn schedule_card(
     };
 
     let interval_days = item.interval.max(1.0);
-    let due = now + Duration::seconds((interval_days as f64 * 86_400.0).round() as i64);
+    let raw_due = now + Duration::seconds((interval_days as f64 * 86_400.0).round() as i64);
+    // Cap next review at 2 days before exam so no card escapes the review window
+    let exam_cutoff = exam_date_hkt() - Duration::days(2);
+    let due = if raw_due > exam_cutoff { exam_cutoff } else { raw_due };
 
     let was_new = prev_memory.is_none();
     let (new_state, step) = if rating == RatingKind::Again {
@@ -957,7 +960,7 @@ fn schedule_card(
     card.step = step;
     card.stability = item.memory.stability as f64;
     card.difficulty = item.memory.difficulty as f64;
-    card.last_review = now.with_timezone(&Utc).to_rfc3339();
+    card.last_review = Some(now.with_timezone(&Utc).to_rfc3339());
     card.due = due.with_timezone(&Utc).to_rfc3339();
 
     if card.card_id == 0 {
@@ -1866,5 +1869,96 @@ mod tests {
         assert_eq!(rating_from_str("guess"), Some(RatingKind::Hard));
         assert_eq!(rating_from_str("ok"), Some(RatingKind::Good));
         assert_eq!(rating_from_str("confident"), Some(RatingKind::Easy));
+    }
+
+    #[test]
+    fn parse_new_card_null_last_review() {
+        // Cards added via migration script have last_review: null — must not be silently dropped
+        let raw = r#"{"card_id": 42, "state": 0, "step": null, "stability": 0.0, "difficulty": 0.0, "due": "2026-03-10T00:00:00+00:00", "last_review": null}"#;
+        let card: PyCard = serde_json::from_str(raw).unwrap();
+        assert_eq!(card.state, 0);
+        assert!(card.last_review.is_none());
+    }
+
+    #[test]
+    fn schedule_card_respects_exam_cap() {
+        // Any scheduled due date must not exceed Apr 2 (exam cutoff = exam_date - 2 days)
+        let now = hkt().with_ymd_and_hms(2026, 3, 10, 12, 0, 0).unwrap();
+        let card = PyCard {
+            card_id: 1,
+            state: 2,
+            step: None,
+            stability: 300.0, // very high stability → FSRS would schedule far in future
+            difficulty: 2.0,
+            due: now.with_timezone(&Utc).to_rfc3339(),
+            last_review: Some(now.with_timezone(&Utc).to_rfc3339()),
+        };
+        let result = schedule_card(card, RatingKind::Easy, now).unwrap();
+        let due = chrono::DateTime::parse_from_rfc3339(&result.due).unwrap();
+        let cutoff = exam_date_hkt() - Duration::days(2);
+        assert!(
+            due <= cutoff,
+            "due {} exceeds exam cutoff {}",
+            due,
+            cutoff
+        );
+    }
+
+    #[test]
+    fn acquisition_cap_logic() {
+        // good/easy ratings should cap to hard when topic accuracy < 60%
+        // This mirrors the inline logic in cmd_record
+        let apply_cap = |rate: f64, rating: RatingKind| -> RatingKind {
+            if rate < 0.60 && (rating == RatingKind::Good || rating == RatingKind::Easy) {
+                RatingKind::Hard
+            } else {
+                rating
+            }
+        };
+        assert_eq!(apply_cap(0.50, RatingKind::Good), RatingKind::Hard);
+        assert_eq!(apply_cap(0.50, RatingKind::Easy), RatingKind::Hard);
+        assert_eq!(apply_cap(0.50, RatingKind::Again), RatingKind::Again); // not capped
+        assert_eq!(apply_cap(0.60, RatingKind::Good), RatingKind::Good);   // at threshold: not capped
+        assert_eq!(apply_cap(0.75, RatingKind::Easy), RatingKind::Easy);   // above threshold: not capped
+    }
+
+    #[test]
+    fn state_file_roundtrip() {
+        // Write state to a temp file, reload it, assert cards survive intact
+        use std::io::Write;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        let now = Utc::now().to_rfc3339();
+        let card = PyCard {
+            card_id: 999,
+            state: 2,
+            step: None,
+            stability: 5.5,
+            difficulty: 3.3,
+            due: now.clone(),
+            last_review: Some(now.clone()),
+        };
+
+        // Write in the same format as save_state
+        let card_json = serde_json::to_string(&card).unwrap();
+        let mut cards_map = serde_json::Map::new();
+        cards_map.insert("test-topic".to_string(), serde_json::Value::String(card_json));
+        let state_json = serde_json::json!({ "cards": cards_map, "review_log": [] });
+        let mut f = std::fs::File::create(&path).unwrap();
+        write!(f, "{}", state_json).unwrap();
+
+        // Reload and verify
+        let text = std::fs::read_to_string(&path).unwrap();
+        let raw: RawState = serde_json::from_str(&text).unwrap();
+        assert!(raw.cards.contains_key("test-topic"));
+        let parsed = match raw.cards["test-topic"].clone() {
+            serde_json::Value::String(s) => serde_json::from_str::<PyCard>(&s).ok(),
+            _ => None,
+        };
+        let loaded = parsed.expect("card should parse without error");
+        assert_eq!(loaded.card_id, 999);
+        assert_eq!(loaded.stability, 5.5);
+        assert!(loaded.last_review.is_some());
     }
 }

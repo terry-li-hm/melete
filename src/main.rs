@@ -8,7 +8,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -1727,99 +1727,73 @@ fn cmd_reconcile() -> Result<()> {
     Ok(())
 }
 
+fn module_prefix(topic: &str) -> &str {
+    topic.split('-').next().unwrap_or(topic)
+}
+
 fn cmd_coverage() -> Result<()> {
     let tracker = parse_tracker()?;
-    let tracked = &tracker.topics;
+    let topics = &tracker.topics;
 
-    let tracked_set: HashSet<String> = tracked.keys().cloned().collect();
-    let syllabus_set: HashSet<String> = GARP_RAI_SYLLABUS.iter().map(|s| s.to_string()).collect();
+    // --- Module rollup ---
+    // Use GARP_RAI_SYLLABUS for canonical order; pull actuals from tracker
+    let mut mod_correct: BTreeMap<&str, i32> = BTreeMap::new();
+    let mut mod_attempts: BTreeMap<&str, i32> = BTreeMap::new();
+    for &syllabus_topic in GARP_RAI_SYLLABUS {
+        let pfx = module_prefix(syllabus_topic);
+        let info = topics.get(syllabus_topic);
+        *mod_correct.entry(pfx).or_insert(0) += info.map(|i| i.correct).unwrap_or(0);
+        *mod_attempts.entry(pfx).or_insert(0) += info.map(|i| i.attempts).unwrap_or(0);
+    }
 
-    let mut missing: Vec<String> = syllabus_set.difference(&tracked_set).cloned().collect();
-    missing.sort();
-
-    let mut never_attempted: Vec<String> = tracked
+    // --- Fragile: accuracy >= 80%, attempts <= 5 ---
+    let mut fragile: Vec<(&String, &TopicInfo)> = topics
         .iter()
-        .filter(|(_, i)| i.attempts == 0)
-        .map(|(t, _)| t.clone())
+        .filter(|(_, i)| i.attempts > 0 && i.attempts <= 5 && i.rate >= 0.80)
         .collect();
-    never_attempted.sort();
+    fragile.sort_by_key(|(t, _)| t.as_str());
 
-    let mut low_coverage: Vec<String> = tracked
+    // --- Low sample: < 3 attempts ---
+    let mut low_sample: Vec<(&String, &TopicInfo)> = topics
         .iter()
-        .filter(|(_, i)| i.attempts > 0 && i.attempts < 3)
-        .map(|(t, _)| t.clone())
+        .filter(|(_, i)| i.attempts < 3)
         .collect();
-    low_coverage.sort_by_key(|t| tracked.get(t).map(|i| i.attempts).unwrap_or(0));
+    low_sample.sort_by_key(|(_, i)| i.attempts);
 
-    let tracked_in_syllabus = tracked_set.intersection(&syllabus_set).count();
-    let coverage_pct = if !GARP_RAI_SYLLABUS.is_empty() {
-        (tracked_in_syllabus as f64 / GARP_RAI_SYLLABUS.len() as f64) * 100.0
-    } else {
-        0.0
-    };
+    // --- Output ---
+    print_panel(&format!("Coverage | {} topics | {} days to exam", topics.len(), days_until_exam()));
 
-    print_panel(&format!(
-        "Coverage Report | {} syllabus topics",
-        GARP_RAI_SYLLABUS.len()
-    ));
-    println!(
-        "  Tracked: {}/{} ({:.0}%)",
-        tracked_in_syllabus,
-        GARP_RAI_SYLLABUS.len(),
-        coverage_pct
-    );
-
-    if !missing.is_empty() {
-        println!();
-        println!(
-            "{} {}",
-            format!("MISSING ({}):", missing.len()).red().bold(),
-            "in syllabus but not in tracker".dimmed()
-        );
-        for t in &missing {
-            println!("  {}", t);
-        }
-    }
-
-    if !never_attempted.is_empty() {
-        println!();
-        println!(
-            "{} {}",
-            format!("NEVER ATTEMPTED ({}):", never_attempted.len())
-                .yellow()
-                .bold(),
-            "in tracker but 0 attempts".dimmed()
-        );
-        for t in &never_attempted {
-            println!("  {}", t);
-        }
-    }
-
-    if !low_coverage.is_empty() {
-        println!();
-        println!(
-            "{} {}",
-            format!("LOW COVERAGE ({}):", low_coverage.len())
-                .cyan()
-                .bold(),
-            "<3 attempts".dimmed()
-        );
-        for t in &low_coverage {
-            if let Some(i) = tracked.get(t) {
-                println!("  {}: {} attempts ({:.0}%)", t, i.attempts, i.rate * 100.0);
-            }
-        }
-    }
-
-    if missing.is_empty() && never_attempted.is_empty() && low_coverage.is_empty() {
-        println!();
-        println!(
-            "  {}",
-            "All syllabus topics covered with adequate attempts.".green()
-        );
+    println!();
+    println!("  {}", "Module rollup (weighted accuracy):".bold());
+    for (pfx, &attempts) in &mod_attempts {
+        let correct = mod_correct.get(pfx).copied().unwrap_or(0);
+        let rate = if attempts > 0 { correct as f64 / attempts as f64 } else { 0.0 };
+        let pct = format!("{:3.0}%", rate * 100.0);
+        let coloured = if rate < 0.70 { pct.red() } else if rate < 0.80 { pct.yellow() } else { pct.green() };
+        println!("    {}   {}  ({} / {})", pfx, coloured, correct, attempts);
     }
 
     println!();
+    if !fragile.is_empty() {
+        println!("  {} {}", format!("FRAGILE ({}):", fragile.len()).yellow().bold(), "accuracy ≥80% but ≤5 questions".dimmed());
+        for (topic, info) in &fragile {
+            println!("    {:<35} {:3.0}%  ({}/{})", topic, info.rate * 100.0, info.correct, info.attempts);
+        }
+    }
+
+    println!();
+    if !low_sample.is_empty() {
+        println!("  {} {}", format!("LOW SAMPLE ({}):", low_sample.len()).red().bold(), "<3 questions — effectively untested".dimmed());
+        for (topic, info) in &low_sample {
+            let acc = if info.attempts > 0 { format!("{:.0}%", info.rate * 100.0) } else { "—".to_string() };
+            println!("    {:<35} {} attempts  ({})", topic, info.attempts, acc);
+        }
+    }
+
+    if fragile.is_empty() && low_sample.is_empty() {
+        println!("  {}", "All topics adequately sampled.".green());
+    }
+
     Ok(())
 }
 

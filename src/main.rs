@@ -614,6 +614,12 @@ fn search_terms(topic: &str) -> Option<&'static [&'static str]> {
         "M1-ai-risks" => Some(&["Risks of Inscrutability", "Risks of Over-Reliance"]),
         "M2-intro-tools" => Some(&["Machine Learning, Classical Statistics"]),
         "M2-data-prep" => Some(&["Data Scaling", "normalization", "standardization"]),
+        "M2-data-types" => Some(&["Data Collection And Preparation", "Structured", "Unstructured"]),
+        "M2-data-cleaning" => Some(&["Data Cleaning", "1.3.2"]),
+        "M2-train-val-test-split" => Some(&["Training Validation And Testing", "Cross Validation", "7.7"]),
+        "M2-linear-regression" => Some(&["Ordinary Least Squares", "7.2 Least Squares", "Linear Regression"]),
+        "M2-rl-value-functions" => Some(&["Terminology in Reinforcement", "Value Function", "Action-Value"]),
+        "M2-nlp-pipeline" => Some(&["Data Pre Processing", "Tokenization", "Stemming", "Lemmatization"]),
         "M2-clustering" => Some(&["K-means", "Hierarchical Clustering", "DBSCAN"]),
         "M2-econometric" => Some(&["Econometric", "Stepwise", "Variable Selection"]),
         "M2-regression-classification" => Some(&[

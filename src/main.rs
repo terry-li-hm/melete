@@ -1325,7 +1325,9 @@ fn cmd_void(topic_input: &str, dry_run: bool) -> Result<()> {
             );
         } else {
             state.review_log.remove(last_idx);
-            state.cards.remove(topic_input);
+            state
+                .cards
+                .insert(topic_input.to_string(), new_card(now_hkt()));
             save_state(&state)?;
             println!(
                 "Voided last review for {} (was: {} on {}). Topic reset to new",
